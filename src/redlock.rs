@@ -1,11 +1,9 @@
-use std::fs::File;
-use std::io::{self, Read};
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use rand::{thread_rng, Rng};
 use redis::Value::Okay;
 use redis::{Client, IntoConnectionInfo, RedisResult, Value};
+use tokio::time::sleep;
 
 const DEFAULT_RETRY_COUNT: u32 = 3;
 const DEFAULT_RETRY_DELAY: u32 = 200;
@@ -62,17 +60,10 @@ impl RedLock {
     }
 
     /// Get 20 random bytes from `/dev/urandom`.
-    pub fn get_unique_lock_id(&self) -> io::Result<Vec<u8>> {
-        let file = File::open("/dev/urandom")?;
-        let mut buf = Vec::with_capacity(20);
-        match file.take(20).read_to_end(&mut buf) {
-            Ok(20) => Ok(buf),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Can't read enough random bytes",
-            )),
-            Err(e) => Err(e),
-        }
+    pub fn get_unique_lock_id(&self) -> Vec<u8> {
+        let mut rng = thread_rng();
+
+        rng.gen::<[u8; 20]>().to_vec()
     }
 
     /// Set retry count and retry delay.
@@ -84,14 +75,14 @@ impl RedLock {
         self.retry_delay = delay;
     }
 
-    fn lock_instance(
+    async fn lock_instance(
         &self,
         client: &redis::Client,
         resource: &[u8],
         val: &[u8],
         ttl: usize,
     ) -> bool {
-        let mut con = match client.get_connection() {
+        let mut con = match client.get_async_connection().await {
             Err(_) => return false,
             Ok(val) => val,
         };
@@ -101,7 +92,8 @@ impl RedLock {
             .arg("nx")
             .arg("px")
             .arg(ttl)
-            .query(&mut con);
+            .query_async(&mut con)
+            .await;
         match result {
             Ok(Okay) => true,
             Ok(_) | Err(_) => false,
@@ -115,8 +107,8 @@ impl RedLock {
     ///
     /// If it fails. `None` is returned.
     /// A user should retry after a short wait time.
-    pub fn lock(&self, resource: &[u8], ttl: usize) -> Option<Lock> {
-        let val = self.get_unique_lock_id().unwrap();
+    pub async fn lock(&self, resource: &[u8], ttl: usize) -> Option<Lock<'_>> {
+        let val = self.get_unique_lock_id();
 
         let mut rng = thread_rng();
 
@@ -124,7 +116,7 @@ impl RedLock {
             let mut n = 0;
             let start_time = Instant::now();
             for client in &self.servers {
-                if self.lock_instance(client, resource, &val, ttl) {
+                if self.lock_instance(client, resource, &val, ttl).await {
                     n += 1;
                 }
             }
@@ -145,23 +137,23 @@ impl RedLock {
                 });
             } else {
                 for client in &self.servers {
-                    self.unlock_instance(client, resource, &val);
+                    self.unlock_instance(client, resource, &val).await;
                 }
             }
 
             let n = rng.gen_range(0..self.retry_delay);
-            sleep(Duration::from_millis(u64::from(n)));
+            sleep(Duration::from_millis(u64::from(n))).await;
         }
         None
     }
 
-    fn unlock_instance(&self, client: &redis::Client, resource: &[u8], val: &[u8]) -> bool {
-        let mut con = match client.get_connection() {
+    async fn unlock_instance(&self, client: &redis::Client, resource: &[u8], val: &[u8]) -> bool {
+        let mut con = match client.get_async_connection().await {
             Err(_) => return false,
             Ok(val) => val,
         };
         let script = redis::Script::new(UNLOCK_SCRIPT);
-        let result: RedisResult<i32> = script.key(resource).arg(val).invoke(&mut con);
+        let result: RedisResult<i32> = script.key(resource).arg(val).invoke_async(&mut con).await;
         match result {
             Ok(val) => val == 1,
             Err(_) => false,
@@ -172,9 +164,10 @@ impl RedLock {
     ///
     /// Unlock is best effort. It will simply try to contact all instances
     /// and remove the key.
-    pub fn unlock(&self, lock: &Lock) {
+    pub async fn unlock(&self, lock: &Lock<'_>) {
         for client in &self.servers {
-            self.unlock_instance(client, &lock.resource, &lock.val);
+            self.unlock_instance(client, &lock.resource, &lock.val)
+                .await;
         }
     }
 }
